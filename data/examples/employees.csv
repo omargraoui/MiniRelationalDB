@@ -1,0 +1,9 @@
+id,name,department_id,salary,age,active
+1,Alice Martin,10,95000,31,true
+2,Bob Chen,20,68000,27,true
+3,Charlie Roy,10,82000,29,true
+4,Diana Patel,30,74000,35,true
+5,Emma Tremblay,20,72000,26,false
+6,Farid Benali,10,105000,42,true
+7,Grace Kim,40,98000,33,true
+8,Hugo Nguyen,30,61000,24,false
