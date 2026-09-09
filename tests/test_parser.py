@@ -55,6 +55,30 @@ def test_invalid_or_unsupported_sql_is_rejected(sql):
         parse(sql)
 
 
+@pytest.mark.parametrize("condition", ["", "id", "id = 1 AND", "id = 1 OR"])
+def test_incomplete_where_reports_end_of_input(condition):
+    sql = f"SELECT * FROM t WHERE {condition}"
+    with pytest.raises(SQLSyntaxError, match=rf"at position {len(sql)}; got ''$"):
+        parse(sql)
+
+
+@pytest.mark.parametrize("sql, diagnostic", [
+    ("SELECT t. FROM t", "Expected an identifier"),
+    ("SELECT * FROM t GROUP BY", "Expected an identifier"),
+    ("SELECT * FROM t ORDER BY", "Expected an identifier"),
+    ("INSERT INTO t VALUES (1,)", "Expected a literal"),
+])
+def test_missing_names_and_list_elements_are_rejected(sql, diagnostic):
+    with pytest.raises(SQLSyntaxError, match=diagnostic):
+        parse(sql)
+
+
+@pytest.mark.parametrize("value", ["-TRUE", "+'text'"])
+def test_sign_requires_a_numeric_literal(value):
+    with pytest.raises(SQLSyntaxError, match="Expected a number after sign"):
+        parse(f"INSERT INTO t VALUES ({value})")
+
+
 def test_keyword_text_and_semicolons_inside_strings_are_data():
     tree = parse("INSERT INTO t VALUES ('WHERE', 'semi; -- still text', 'it''s fine')")
     assert tree.rows == (("WHERE", "semi; -- still text", "it's fine"),)
