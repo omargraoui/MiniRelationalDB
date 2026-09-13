@@ -86,11 +86,21 @@ class Executor:
         stats = ExecutionStats(join_strategy=join_strategy if join_plans else None)
         row_ids = None
         if use_indexes and not join_plans and condition:
+            best = None
+            best_count = None
             for column, value in equality_candidates(condition):
-                if column.name in table.indexes:
-                    row_ids = table.indexes[column.name].lookup(value)
-                    stats.indexes_used.append(f"{table.name}.{column.name}")
-                    break
+                index = table.indexes.get(column.name)
+                if index is not None:
+                    count = index.count(value)
+                    # Strict comparison keeps the first candidate on ties.
+                    if best_count is None or count < best_count:
+                        best = (index, column, value)
+                        best_count = count
+            if best is not None:
+                index, column, value = best
+                # Copy only the chosen bucket, never all candidate buckets.
+                row_ids = index.lookup(value)
+                stats.indexes_used.append(f"{table.name}.{column.name}")
         rows = self.scan(table, stats, row_ids)
         join_function = hash_join if join_strategy == "hash" else nested_loop_join
         for right, left_key, right_key in join_plans:

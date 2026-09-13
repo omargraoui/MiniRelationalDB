@@ -215,8 +215,13 @@ assert indexed.rows == scanned.rows
 print(indexed.stats)
 ```
 
-For a **single-table** query, the executor uses the first available indexed
-column/literal equality that is required by the predicate. It supports reversed
+For a **single-table** query, the executor chooses the indexed column/literal
+equality with the fewest matching row IDs among those required by the predicate.
+It reads exact bucket sizes without copying row IDs, then fetches only the chosen
+bucket. Counts reflect subsequent insertions without separate statistics or a
+table scan. Ties keep the first eligible equality in predicate order. For example,
+`department_id = 10 AND id = 42` uses the `id` index when it has fewer candidates,
+even though the department condition appears first. It supports reversed
 equality (`42 = id`) and safe `AND` conjuncts. All residual predicates are still
 evaluated on candidates. It never extracts an equality from inside an `OR` branch:
 `id = 1 OR id = 2` scans, while `(id = 1 OR id = 2) AND department_id = 10` may use
@@ -253,6 +258,7 @@ below assume fixed row width, bounded-size keys, and normal hash behavior.
 | Full equality scan | O(n) | Plus O(r) materialized results |
 | Hash index construction | O(n) average | O(n) row IDs and buckets |
 | Hash index lookup | O(1) average bucket access + O(k) candidate handling | Lookup copies k row IDs; residual filtering/projection still costs work |
+| Index candidate sizing | O(e) average for e eligible indexed equalities | O(1) per bucket-size check, with no row-ID copies |
 | Insert with h indexes | O(h) average index maintenance per row | Plus schema validation and amortized row append |
 | Nested-loop join | O(n * m + r) | O(m) right-side buffer, plus materialized output |
 | Hash join | O(n + m + r) average | O(m) right-side buckets, plus materialized output |
@@ -344,7 +350,8 @@ Tests cover typed insertion and failed-batch atomic validation; tokenizer tokens
 escaping and AST structure; predicates and precedence; projection and sorting;
 all aggregates and empty input; name/type validation; both join algorithms,
 duplicate keys and chained joins; index creation, maintenance, actual candidate
-reads, scan equivalence, and unsafe `OR` cases. Deterministic generated joins are
+reads, scan equivalence, and unsafe `OR` cases; selective index choice, predicate
+order, empty buckets, and updated bucket counts after insertion. Generated joins are
 checked against an explicit reference result, preserving duplicate multiplicity.
 No test uses another SQL engine as an oracle.
 
@@ -359,6 +366,11 @@ python benchmarks/benchmark.py --repeats 7 --output benchmarks/results.csv
 
 - Search tables contain 1,000, 10,000, and 50,000 unique IDs. The same equality
   query selects an existing middle ID with forced scan and with indexed access.
+- Selectivity tables use the same sizes with a unique ID and two equally sized
+  categories. A category-only index provides the broad access baseline; after
+  adding an ID index outside timing, both orders of the same `AND` predicate must
+  fetch one row through the ID index. The baseline reproduces the previous
+  first-index access path; it is not a timing of a historical engine version.
 - Join sizes are 100 x 50, 500 x 250, and 1,000 x 500. Right-side keys occur twice,
   exercising duplicate handling and yielding twice the left input row count.
 - Each algorithm gets one untimed warm-up and seven timed repetitions by default.

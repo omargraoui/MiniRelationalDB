@@ -62,6 +62,38 @@ def search_benchmarks(repeats):
     return records
 
 
+def selectivity_benchmarks(repeats):
+    records = []
+    for size in (1_000, 10_000, 50_000):
+        database = Database()
+        table = database.create_table("items", [
+            Column("id", "INT"), Column("category", "INT"), Column("payload", "TEXT"),
+        ])
+        table.insert_many((i, i % 2, f"item_{i}") for i in range(size))
+        table.create_hash_index("category")
+        target = size // 2
+        broad_first = f"SELECT payload FROM items WHERE category = 0 AND id = {target}"
+        narrow_first = f"SELECT payload FROM items WHERE id = {target} AND category = 0"
+        baseline = database.execute(broad_first, use_indexes=False)
+        # With only category indexed, reproduce the old first-index access path.
+        # Then add id outside timing and check both predicate orders.
+        for algorithm, sql in (("broad_only", broad_first),
+                               ("broad_first", broad_first), ("narrow_first", narrow_first)):
+            if algorithm == "broad_first":
+                table.create_hash_index("id")
+            seconds, result = measure(lambda: database.execute(sql), repeats)
+            if result.rows != baseline.rows or result.rows != ((f"item_{target}",),):
+                raise AssertionError("Selectivity results differ")
+            expected_scans = size // 2 if algorithm == "broad_only" else 1
+            expected_index = "items.category" if algorithm == "broad_only" else "items.id"
+            if result.stats.rows_scanned != expected_scans or result.stats.indexes_used != [expected_index]:
+                raise AssertionError("Selectivity query did not choose the expected index")
+            entry = record("selectivity", size, 0, algorithm, seconds, repeats, result)
+            entry["index_build_seconds"] = ""
+            records.append(entry)
+    return records
+
+
 def join_benchmarks(repeats):
     records = []
     for left_size, right_size in ((100, 50), (500, 250), (1_000, 500)):
@@ -96,7 +128,8 @@ def main():
     if args.repeats < 2:
         parser.error("--repeats must be at least 2")
     print(f"Python {platform.python_version()} | {platform.platform()}")
-    records = search_benchmarks(args.repeats) + join_benchmarks(args.repeats)
+    records = (search_benchmarks(args.repeats) + selectivity_benchmarks(args.repeats)
+               + join_benchmarks(args.repeats))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(records[0]))

@@ -17,3 +17,7 @@ class HashIndex:
     def lookup(self, value: Value) -> tuple[int, ...]:
         """Return matching row IDs without exposing mutable buckets."""
         return tuple(self._buckets.get(value, ()))
+
+    def count(self, value: Value) -> int:
+        """Return the exact bucket size without copying row IDs (O(1) average)."""
+        return len(self._buckets.get(value, ()))

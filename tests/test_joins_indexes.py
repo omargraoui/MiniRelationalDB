@@ -120,3 +120,94 @@ def test_empty_index_and_typed_keys():
         assert result.rows == (("new",),) and result.stats.rows_scanned == 1
     with pytest.raises(TypeValidationError):
         db.execute("SELECT * FROM t WHERE active = 1")
+
+
+@pytest.mark.parametrize("condition", [
+    "department_id = 10 AND id = 3",
+    "id = 3 AND department_id = 10",
+    "10 = employees.department_id AND 3.0 = employees.id",
+    "department_id = 10 AND (id = 3 AND salary > 0)",
+    "(salary > 85000 OR active = TRUE) AND department_id = 10 AND id = 3",
+])
+def test_most_selective_index_is_independent_of_predicate_order(db, monkeypatch, condition):
+    table = db.get_table("employees")
+    broad = table.create_hash_index("department_id")
+    table.create_hash_index("id")
+    sql = f"SELECT name FROM employees WHERE {condition}"
+    scanned = db.execute(sql, use_indexes=False)
+
+    def unexpected_lookup(value):
+        pytest.fail("Planning must not copy row IDs from an unselected index")
+
+    monkeypatch.setattr(broad, "lookup", unexpected_lookup)
+    original = table.iter_rows
+
+    def tracked(row_ids=None):
+        assert row_ids == (2,), "Only the most selective bucket should be read"
+        yield from original(row_ids)
+
+    monkeypatch.setattr(table, "iter_rows", tracked)
+    result = db.execute(sql)
+    assert result.rows == scanned.rows == (("Charlie",),)
+    assert result.stats.indexes_used == ["employees.id"]
+    assert result.stats.rows_scanned == 1
+
+
+@pytest.mark.parametrize("condition,expected,scans,index", [
+    ("department_id = 10 AND id = 999", (), 0, "id"),
+    ("department_id = 10 AND id = 3 AND salary > 85000", (), 1, "id"),
+    ("department_id = 10 AND (id = 1 OR id = 3)", ((1,), (3,)), 2, "department_id"),
+    ("department_id = 10 OR id = 2", ((1,), (2,), (3,)), 5, None),
+    ("department_id = 30 AND id = 5", ((5,),), 1, "department_id"),
+])
+def test_selective_index_empty_buckets_residuals_or_and_ties(db, condition, expected, scans, index):
+    table = db.get_table("employees")
+    table.create_hash_index("department_id")
+    table.create_hash_index("id")
+    sql = f"SELECT id FROM employees WHERE {condition} ORDER BY id"
+    result = db.execute(sql)
+    assert result.rows == db.execute(sql, use_indexes=False).rows == expected
+    assert result.stats.rows_scanned == scans
+    assert result.stats.indexes_used == ([f"employees.{index}"] if index else [])
+
+
+def test_index_selection_tracks_insertions_and_preserves_duplicate_rows():
+    db = Database()
+    table = db.create_table("items", [Column("category", "INT"), Column("code", "INT")])
+    table.insert_many([(1, 7), (2, 7), (3, 7)])
+    category = table.create_hash_index("category")
+    code = table.create_hash_index("code")
+    sql = "SELECT * FROM items WHERE code = 7 AND category = 1"
+    before = db.execute(sql)
+    assert before.rows == ((1, 7),)
+    assert before.stats.indexes_used == ["items.category"]
+    assert before.stats.rows_scanned == 1
+    table.insert_many([(1, 8)] * 4 + [(1, 7)] * 2)
+    assert category.count(1) == 7
+    assert code.count(7) == 5
+    after = db.execute(sql)
+    assert after.rows == db.execute(sql, use_indexes=False).rows == ((1, 7),) * 3
+    assert after.stats.indexes_used == ["items.code"]
+    assert after.stats.rows_scanned == 5
+
+
+def test_empty_index_candidate_does_not_skip_semantic_validation(db):
+    db.get_table("employees").create_hash_index("id")
+    with pytest.raises(TypeValidationError):
+        db.execute("SELECT * FROM employees WHERE id = 999 AND active = 1")
+
+
+@pytest.mark.parametrize("data_type,value,probe,missing", [
+    ("INT", 7, 7.0, 8), ("FLOAT", 7.0, 7, 8.0),
+    ("TEXT", "seven", "seven", "eight"), ("BOOL", True, True, False),
+])
+def test_index_counts_track_buckets_and_failed_batches(data_type, value, probe, missing):
+    table = Database().create_table("items", [Column("value", data_type)])
+    index = table.create_hash_index("value")
+    assert index.count(probe) == 0
+    table.insert_many([(value,), (value,)])
+    assert index.count(probe) == len(index.lookup(probe)) == 2
+    assert index.count(missing) == 0
+    with pytest.raises(TypeValidationError):
+        table.insert_many([(value,), (None,)])
+    assert index.count(probe) == len(index.lookup(probe)) == 2

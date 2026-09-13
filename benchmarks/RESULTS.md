@@ -39,3 +39,27 @@ That generated file is ignored by Git; rerunning the script replaces it. This
 document retains the recorded snapshot. Timings vary between runs, particularly
 for short indexed queries; these measurements do not establish a universal
 speedup or production workload performance.
+
+## Selective index choice (2026-09-13)
+
+Run with Python 3.13.5 on Windows-11-10.0.26200-SP0 using
+`python benchmarks/benchmark.py` (seven repetitions after one warm-up).
+Each table has unique IDs and two equally sized categories. The query selects
+the middle ID and its category, returning exactly one row.
+
+The category-only baseline reproduces the previous first-index access path.
+After adding the ID index outside timing, the engine selects it for both orders
+of the `AND` predicate. This compares access paths in the current engine, not
+separate historical builds. All results were checked against a forced full scan;
+chosen indexes and exact row-read counts were also verified.
+
+| Input rows | Category only (ms) | Both indexes, category first (ms) | Both indexes, ID first (ms) | Rows read, baseline / selective |
+| ---: | ---: | ---: | ---: | ---: |
+| 1,000 | 0.414 | 0.060 | 0.057 | 500 / 1 |
+| 10,000 | 3.598 | 0.063 | 0.063 | 5,000 / 1 |
+| 50,000 | 19.521 | 0.057 | 0.056 | 25,000 / 1 |
+
+Timings include parsing, index selection, residual filtering, and materialization.
+Index construction and data insertion are excluded. Local timings are noisy;
+the deterministic improvement is reading one candidate instead of half the table.
+The search and join benchmarks also passed their correctness/access-path checks.
