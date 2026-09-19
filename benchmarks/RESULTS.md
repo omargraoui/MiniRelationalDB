@@ -63,3 +63,30 @@ Timings include parsing, index selection, residual filtering, and materializatio
 Index construction and data insertion are excluded. Local timings are noisy;
 the deterministic improvement is reading one candidate instead of half the table.
 The search and join benchmarks also passed their correctness/access-path checks.
+
+## Index intersection for AND predicates (2026-09-19)
+
+Run with Python 3.13.5 on Windows-11-10.0.26200-SP0 using
+`python benchmarks/benchmark.py` (seven repetitions after one warm-up).
+Each table has two columns, `region` and `tier`, independently partitioning rows
+into 10 equally selective groups (10% of rows each); their true joint match is
+10x smaller than either bucket alone. The region-only baseline reproduces the
+previous single-index access path (the most-selective-index choice added in the
+prior commit, which has no way to combine two indexes). After adding a `tier`
+index outside timing, the engine intersects both for the same `AND` predicate.
+
+| Input rows | Region only (ms) | Region + tier intersected (ms) | Rows scanned, single / intersected |
+| ---: | ---: | ---: | ---: |
+| 1,000 | 0.118 | 0.076 | 100 / 10 |
+| 10,000 | 0.688 | 0.239 | 1,000 / 100 |
+| 50,000 | 3.904 | 1.720 | 5,000 / 500 |
+
+Rows scanned drop by exactly 10x at every size, matching the constructed
+selectivity of the two independent partitions; this is a deterministic property
+of the access path, not a timing artifact. Wall-clock time also improved at every
+size in this run, but short in-memory timings are noisy and depend on hardware
+and system activity. A regression test (`test_index_intersection_never_probes_a_bucket_larger_than_the_candidates_assembled`)
+confirms the engine still never copies a bucket larger than the candidate set
+already assembled, so a highly selective single index (e.g. a unique key) is
+never penalized by intersecting against a much broader one. The search, join,
+and selectivity benchmarks also passed their correctness/access-path checks.

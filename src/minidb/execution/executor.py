@@ -86,21 +86,29 @@ class Executor:
         stats = ExecutionStats(join_strategy=join_strategy if join_plans else None)
         row_ids = None
         if use_indexes and not join_plans and condition:
-            best = None
-            best_count = None
+            candidates = []
             for column, value in equality_candidates(condition):
                 index = table.indexes.get(column.name)
                 if index is not None:
-                    count = index.count(value)
-                    # Strict comparison keeps the first candidate on ties.
-                    if best_count is None or count < best_count:
-                        best = (index, column, value)
-                        best_count = count
-            if best is not None:
-                index, column, value = best
-                # Copy only the chosen bucket, never all candidate buckets.
-                row_ids = index.lookup(value)
+                    candidates.append((index.count(value), column, value, index))
+            if candidates:
+                # Stable sort: ties keep the first eligible equality in predicate order.
+                candidates.sort(key=lambda candidate: candidate[0])
+                _, column, value, index = candidates[0]
+                first_bucket = index.lookup(value)
                 stats.indexes_used.append(f"{table.name}.{column.name}")
+                remaining = set(first_bucket)
+                for count, column, value, index in candidates[1:]:
+                    # Only probe a bucket that is no larger than the candidate set
+                    # already assembled, so intersecting never costs more than the
+                    # single-index access already committed to.
+                    if not remaining or count > len(remaining):
+                        break
+                    remaining &= set(index.lookup(value))
+                    stats.indexes_used.append(f"{table.name}.{column.name}")
+                # A lone candidate keeps its bucket's row-ID order; combining two or
+                # more loses set order, so the intersection is restored to row order.
+                row_ids = first_bucket if len(stats.indexes_used) == 1 else tuple(sorted(remaining))
         rows = self.scan(table, stats, row_ids)
         join_function = hash_join if join_strategy == "hash" else nested_loop_join
         for right, left_key, right_key in join_plans:

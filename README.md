@@ -215,18 +215,24 @@ assert indexed.rows == scanned.rows
 print(indexed.stats)
 ```
 
-For a **single-table** query, the executor chooses the indexed column/literal
-equality with the fewest matching row IDs among those required by the predicate.
-It reads exact bucket sizes without copying row IDs, then fetches only the chosen
-bucket. Counts reflect subsequent insertions without separate statistics or a
-table scan. Ties keep the first eligible equality in predicate order. For example,
-`department_id = 10 AND id = 42` uses the `id` index when it has fewer candidates,
-even though the department condition appears first. It supports reversed
-equality (`42 = id`) and safe `AND` conjuncts. All residual predicates are still
-evaluated on candidates. It never extracts an equality from inside an `OR` branch:
-`id = 1 OR id = 2` scans, while `(id = 1 OR id = 2) AND department_id = 10` may use
-an index on `department_id`. Range predicates and column/column equalities scan.
-No index intersection, index union, or index-based join is implemented.
+For a **single-table** query, the executor reads the exact bucket size of every
+indexed column/literal equality required by the predicate, without copying any
+row IDs, then sorts those candidates from fewest matching rows to most. It always
+fetches the smallest bucket. It then intersects additional candidates, cheapest
+first, as long as each one's bucket is no larger than the row-ID set already
+assembled, so an extra probe never costs more than the single-index access already
+committed to; the first probe that would exceed that budget stops the intersection.
+Ties keep the first eligible equality in predicate order and combine with any
+other equally cheap candidate. For example, `department_id = 10 AND id = 42` uses
+only the `id` index when it has fewer candidates, even though the department
+condition appears first, but `region = 3 AND tier = 7` intersects both indexes
+when they are equally selective. It supports reversed equality (`42 = id`) and
+safe `AND` conjuncts. All residual predicates are still evaluated on candidates.
+It never extracts an equality from inside an `OR` branch: `id = 1 OR id = 2`
+scans, while `(id = 1 OR id = 2) AND department_id = 10` may use an index on
+`department_id`. Range predicates and column/column equalities scan. There is
+no index union for `OR`, cost-based estimation beyond exact bucket counts, or
+index-based join.
 
 ### Execution statistics
 
@@ -235,7 +241,7 @@ Every query returns its own counters in `result.stats`:
 | Counter | What is actually counted |
 | --- | --- |
 | `rows_scanned` | Base-table rows fetched, including index candidates, summed across tables |
-| `indexes_used` | Qualified column names for actual indexed access, or an empty list |
+| `indexes_used` | Qualified column names for each index actually probed, cheapest first, or an empty list |
 | `join_strategy` | Selected algorithm when a join runs, otherwise `None` |
 | `join_comparisons` | Explicit pairwise equality checks in nested-loop joins |
 | `hash_build_rows` | Rows inserted into hash-join buckets |
@@ -259,6 +265,7 @@ below assume fixed row width, bounded-size keys, and normal hash behavior.
 | Hash index construction | O(n) average | O(n) row IDs and buckets |
 | Hash index lookup | O(1) average bucket access + O(k) candidate handling | Lookup copies k row IDs; residual filtering/projection still costs work |
 | Index candidate sizing | O(e) average for e eligible indexed equalities | O(1) per bucket-size check, with no row-ID copies |
+| Index intersection | O(sum of probed bucket sizes) average, each probed bucket bounded by the candidate set already assembled | Probed buckets copied into a row-ID set; result restored to row order via a sort over the final candidates |
 | Insert with h indexes | O(h) average index maintenance per row | Plus schema validation and amortized row append |
 | Nested-loop join | O(n * m + r) | O(m) right-side buffer, plus materialized output |
 | Hash join | O(n + m + r) average | O(m) right-side buckets, plus materialized output |
@@ -351,8 +358,10 @@ escaping and AST structure; predicates and precedence; projection and sorting;
 all aggregates and empty input; name/type validation; both join algorithms,
 duplicate keys and chained joins; index creation, maintenance, actual candidate
 reads, scan equivalence, and unsafe `OR` cases; selective index choice, predicate
-order, empty buckets, and updated bucket counts after insertion. Generated joins are
-checked against an explicit reference result, preserving duplicate multiplicity.
+order, empty buckets, and updated bucket counts after insertion; index intersection
+across equally selective independent columns, the bound on probing a larger bucket,
+and a contradictory equality short-circuiting to zero scanned rows. Generated joins
+are checked against an explicit reference result, preserving duplicate multiplicity.
 No test uses another SQL engine as an oracle.
 
 When Git is initialized, also run `git diff --check`. Repository creation,
@@ -371,6 +380,11 @@ python benchmarks/benchmark.py --repeats 7 --output benchmarks/results.csv
   adding an ID index outside timing, both orders of the same `AND` predicate must
   fetch one row through the ID index. The baseline reproduces the previous
   first-index access path; it is not a timing of a historical engine version.
+- Intersection tables use the same sizes with two columns, `region` and `tier`,
+  each independently partitioning rows into 10 equally selective groups; their
+  true joint match is 10x smaller than either bucket alone. A region-only index
+  provides the single-index baseline; adding a `tier` index outside timing
+  intersects both for the same `AND` predicate.
 - Join sizes are 100 x 50, 500 x 250, and 1,000 x 500. Right-side keys occur twice,
   exercising duplicate handling and yielding twice the left input row count.
 - Each algorithm gets one untimed warm-up and seven timed repetitions by default.

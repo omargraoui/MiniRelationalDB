@@ -94,6 +94,40 @@ def selectivity_benchmarks(repeats):
     return records
 
 
+def intersection_benchmarks(repeats):
+    records = []
+    buckets = 10
+    for size in (1_000, 10_000, 50_000):
+        database = Database()
+        table = database.create_table("items", [
+            Column("id", "INT"), Column("region", "INT"), Column("tier", "INT"), Column("payload", "TEXT"),
+        ])
+        # region and tier independently partition the rows into `buckets` equally
+        # sized, equally selective groups; their true joint match is `buckets`
+        # times smaller than either bucket alone.
+        table.insert_many((i, i % buckets, (i // buckets) % buckets, f"item_{i}") for i in range(size))
+        table.create_hash_index("region")
+        sql = "SELECT payload FROM items WHERE region = 3 AND tier = 7"
+        baseline = database.execute(sql, use_indexes=False)
+        expected_rows = size // (buckets * buckets)
+        # With only region indexed, reproduce the single-index access path.
+        # Then add a tier index outside timing and check the combined path.
+        for algorithm in ("region_only", "region_and_tier"):
+            if algorithm == "region_and_tier":
+                table.create_hash_index("tier")
+            seconds, result = measure(lambda: database.execute(sql), repeats)
+            if result.rows != baseline.rows or len(result.rows) != expected_rows:
+                raise AssertionError("Intersection results differ")
+            expected_scans = size // buckets if algorithm == "region_only" else expected_rows
+            expected_indexes = ["items.region"] if algorithm == "region_only" else ["items.region", "items.tier"]
+            if result.stats.rows_scanned != expected_scans or result.stats.indexes_used != expected_indexes:
+                raise AssertionError("Intersection query did not choose the expected access path")
+            entry = record("intersection", size, 0, algorithm, seconds, repeats, result)
+            entry["index_build_seconds"] = ""
+            records.append(entry)
+    return records
+
+
 def join_benchmarks(repeats):
     records = []
     for left_size, right_size in ((100, 50), (500, 250), (1_000, 500)):
@@ -129,7 +163,7 @@ def main():
         parser.error("--repeats must be at least 2")
     print(f"Python {platform.python_version()} | {platform.platform()}")
     records = (search_benchmarks(args.repeats) + selectivity_benchmarks(args.repeats)
-               + join_benchmarks(args.repeats))
+               + intersection_benchmarks(args.repeats) + join_benchmarks(args.repeats))
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(records[0]))

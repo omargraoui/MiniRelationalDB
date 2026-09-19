@@ -158,7 +158,9 @@ def test_most_selective_index_is_independent_of_predicate_order(db, monkeypatch,
     ("department_id = 10 AND id = 3 AND salary > 85000", (), 1, "id"),
     ("department_id = 10 AND (id = 1 OR id = 3)", ((1,), (3,)), 2, "department_id"),
     ("department_id = 10 OR id = 2", ((1,), (2,), (3,)), 5, None),
-    ("department_id = 30 AND id = 5", ((5,),), 1, "department_id"),
+    # department_id = 30 and id = 5 both match exactly one (the same) row: the two
+    # equally selective indexes tie and are intersected rather than only one chosen.
+    ("department_id = 30 AND id = 5", ((5,),), 1, ("department_id", "id")),
 ])
 def test_selective_index_empty_buckets_residuals_or_and_ties(db, condition, expected, scans, index):
     table = db.get_table("employees")
@@ -168,7 +170,13 @@ def test_selective_index_empty_buckets_residuals_or_and_ties(db, condition, expe
     result = db.execute(sql)
     assert result.rows == db.execute(sql, use_indexes=False).rows == expected
     assert result.stats.rows_scanned == scans
-    assert result.stats.indexes_used == ([f"employees.{index}"] if index else [])
+    if index is None:
+        expected_indexes = []
+    elif isinstance(index, str):
+        expected_indexes = [f"employees.{index}"]
+    else:
+        expected_indexes = [f"employees.{name}" for name in index]
+    assert result.stats.indexes_used == expected_indexes
 
 
 def test_index_selection_tracks_insertions_and_preserves_duplicate_rows():
@@ -189,6 +197,55 @@ def test_index_selection_tracks_insertions_and_preserves_duplicate_rows():
     assert after.rows == db.execute(sql, use_indexes=False).rows == ((1, 7),) * 3
     assert after.stats.indexes_used == ["items.code"]
     assert after.stats.rows_scanned == 5
+
+
+def test_index_intersection_combines_equally_selective_independent_columns():
+    # region = i % 10 and tier = (i // 10) % 10 are independent and equally
+    # selective (100 rows each out of 1,000); their true joint match is 10x
+    # smaller than either bucket alone, so intersecting both beats picking one.
+    database = Database()
+    table = database.create_table("items", [Column("id", "INT"), Column("region", "INT"), Column("tier", "INT")])
+    table.insert_many((i, i % 10, (i // 10) % 10) for i in range(1000))
+    table.create_hash_index("region")
+    table.create_hash_index("tier")
+    assert table.indexes["region"].count(3) == table.indexes["tier"].count(7) == 100
+    sql = "SELECT id FROM items WHERE region = 3 AND tier = 7"
+    result = database.execute(sql)
+    assert result.rows == database.execute(sql, use_indexes=False).rows
+    assert len(result.rows) == 10
+    assert result.stats.indexes_used == ["items.region", "items.tier"]
+    assert result.stats.rows_scanned == 10
+
+
+def test_index_intersection_never_probes_a_bucket_larger_than_the_candidates_assembled(monkeypatch):
+    # A unique id match (1 row) must never pay to copy a much broader bucket
+    # (500 rows): combining only helps when it is at most as expensive as the
+    # access already committed to, so the broad index is left untouched.
+    database = Database()
+    table = database.create_table("items", [Column("id", "INT"), Column("category", "INT")])
+    table.insert_many((i, i % 2) for i in range(1000))
+    category = table.create_hash_index("category")
+    table.create_hash_index("id")
+
+    def unexpected_lookup(value):
+        pytest.fail("Intersection must not copy row IDs from a bucket larger than the current candidates")
+
+    monkeypatch.setattr(category, "lookup", unexpected_lookup)
+    result = database.execute("SELECT id FROM items WHERE category = 0 AND id = 42")
+    assert result.rows == ((42,),)
+    assert result.stats.indexes_used == ["items.id"]
+    assert result.stats.rows_scanned == 1
+
+
+def test_index_intersection_short_circuits_a_contradictory_equality_on_one_column(db):
+    # id = 3 AND id = 4 can never both hold for a single row: intersecting the
+    # two singleton buckets finds the contradiction without any residual scan.
+    table = db.get_table("employees")
+    table.create_hash_index("id")
+    result = db.execute("SELECT id FROM employees WHERE id = 3 AND id = 4")
+    assert result.rows == ()
+    assert result.stats.rows_scanned == 0
+    assert result.stats.indexes_used == ["employees.id", "employees.id"]
 
 
 def test_empty_index_candidate_does_not_skip_semantic_validation(db):
